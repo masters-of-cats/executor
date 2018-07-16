@@ -56,6 +56,7 @@ type storeNode struct {
 	dependencyManager          DependencyManager
 	volumeManager              volman.Manager
 	credManager                CredManager
+	rotatingCredChan           <-chan Credential
 	eventEmitter               event.Hub
 	transformer                transformer.Transformer
 	process                    ifrit.Process
@@ -410,8 +411,9 @@ func (n *storeNode) Run(logger lager.Logger) error {
 
 	logStreamer := logStreamerFromLogConfig(n.info.LogConfig, n.metronClient)
 
-	credManagerRunner, rotatingCredChan := n.credManager.Runner(logger, n.info)
-	proxyConfigRunner, err := n.proxyManager.Runner(logger, n.info, rotatingCredChan)
+	var credManagerRunner ifrit.Runner
+	credManagerRunner, n.rotatingCredChan = n.credManager.Runner(logger, n.info)
+	proxyConfigRunner, err := n.proxyManager.Runner(logger, n.info, n.rotatingCredChan)
 	if err != nil {
 		n.completeWithError(logger, err)
 		return err
@@ -508,11 +510,20 @@ func (n *storeNode) stop(logger lager.Logger) {
 	n.infoLock.Lock()
 	stopped := n.info.RunResult.Stopped
 	n.info.RunResult.Stopped = true
+	info := n.info.Copy()
 	n.infoLock.Unlock()
 	if n.process != nil {
 		if !stopped {
 			logStreamer := logStreamerFromLogConfig(n.info.LogConfig, n.metronClient)
 			fmt.Fprintf(logStreamer.Stdout(), "Cell %s stopping instance %s\n", n.cellID, n.Info().Guid)
+		}
+
+		creds, err := n.credManager.GenerateCreds(logger, info, time.Time{}, time.Time{})
+		if err != nil {
+			//log?
+		}
+		if n.rotatingCredChan != nil {
+			n.rotatingCredChan <- creds
 		}
 
 		n.process.Signal(os.Interrupt)
