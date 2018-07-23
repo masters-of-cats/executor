@@ -1350,12 +1350,15 @@ var _ = Describe("Container Store", func() {
 
 			Context("while the cred manager & proxy manager are still setting up", func() {
 				var (
-					cmFinishSetup         chan struct{}
-					pmFinishSetup         chan struct{}
-					containerRunnerCalled chan struct{}
-					rotatingCredChan      chan containerstore.Credential
-					ldsPort               uint16
-					credManagerBindMount  []garden.BindMount
+					cmFinishSetup            chan struct{}
+					pmFinishSetup            chan struct{}
+					containerRunnerCalled    chan struct{}
+					rotatingCredChan         chan containerstore.Credential
+					ldsPort                  uint16
+					credManagerBindMount     []garden.BindMount
+					proxyManagerSignalled    chan struct{}
+					credManagerSignalled     chan struct{}
+					containerRunnerSignalled chan struct{}
 				)
 
 				BeforeEach(func() {
@@ -1364,6 +1367,10 @@ var _ = Describe("Container Store", func() {
 					rotatingCredChan = make(chan containerstore.Credential)
 					containerRunnerCalled = make(chan struct{})
 					ldsPort = 65535
+
+					proxyManagerSignalled = make(chan struct{}, 1)
+					credManagerSignalled = make(chan struct{}, 1)
+					containerRunnerSignalled = make(chan struct{}, 1)
 
 					credManagerBindMount = []garden.BindMount{
 						{
@@ -1382,6 +1389,7 @@ var _ = Describe("Container Store", func() {
 						<-cmFinishSetup
 						close(ready)
 						<-signals
+						credManagerSignalled <- struct{}{}
 						return nil
 					}), rotatingCredChan)
 
@@ -1390,6 +1398,7 @@ var _ = Describe("Container Store", func() {
 						<-pmFinishSetup
 						close(ready)
 						<-signals
+						proxyManagerSignalled <- struct{}{}
 						return nil
 					})
 					proxyManager.RunnerReturns(proxyRunner, nil)
@@ -1397,6 +1406,8 @@ var _ = Describe("Container Store", func() {
 
 					megatron.StepsRunnerReturns(ifrit.RunFunc(func(signals <-chan os.Signal, ready chan<- struct{}) error {
 						close(containerRunnerCalled)
+						<-signals
+						containerRunnerSignalled <- struct{}{}
 						return nil
 					}), nil)
 				})
@@ -1452,12 +1463,43 @@ var _ = Describe("Container Store", func() {
 							go containerStore.Run(logger, containerGuid)
 							Eventually(containerRunnerCalled).Should(BeClosed())
 						})
+
+						Context("when the runner is signalled", func() {
+							JustBeforeEach(func() {
+								err := containerStore.Run(logger, containerGuid)
+								Expect(err).NotTo(HaveOccurred())
+								Eventually(containerRunnerCalled).Should(BeClosed())
+							})
+
+							It("shuts down the app before shutting down the proxy manager", func() {
+								err := containerStore.Stop(logger, containerGuid)
+								Expect(err).NotTo(HaveOccurred())
+
+								Eventually(credManagerSignalled).Should(Receive())
+								Eventually(containerRunnerSignalled).Should(Receive())
+								Eventually(proxyManagerSignalled).Should(Receive())
+							})
+						})
 					})
 				})
 			})
 
 			Context("when the runner fails the initial credential generation", func() {
+				var pmSignaled chan struct{}
+
 				BeforeEach(func() {
+					pmSignaled = make(chan struct{}, 1)
+					signaled := pmSignaled
+
+					proxyRunner.RunStub = ifrit.RunFunc(func(signals <-chan os.Signal, ready chan<- struct{}) error {
+						close(ready)
+						<-signals
+						signaled <- struct{}{}
+						return nil
+					})
+
+					proxyManager.RunnerReturns(proxyRunner, nil)
+
 					credManager.RunnerReturns(ifrit.RunFunc(func(signals <-chan os.Signal, ready chan<- struct{}) error {
 						return errors.New("BOOOM")
 					}), nil)
@@ -1499,13 +1541,17 @@ var _ = Describe("Container Store", func() {
 						return events
 					}).Should(ConsistOf("container_reserved", "container_complete"))
 				})
+
+				It("signals the proxy manager to shut down", func() {
+					err := containerStore.Run(logger, containerGuid)
+					Expect(err).NotTo(HaveOccurred())
+
+					Eventually(pmSignaled).Should(Receive())
+				})
 			})
 
 			Context("when the runner fails the initial proxy config generation", func() {
-				var cmSignaled chan struct{}
 				BeforeEach(func() {
-					cmSignaled = make(chan struct{}, 1)
-					signaled := cmSignaled
 					proxyRunner.RunStub = ifrit.RunFunc(func(signals <-chan os.Signal, ready chan<- struct{}) error {
 						return errors.New("BOOOM")
 					})
@@ -1514,7 +1560,6 @@ var _ = Describe("Container Store", func() {
 					credManager.RunnerReturns(ifrit.RunFunc(func(signals <-chan os.Signal, ready chan<- struct{}) error {
 						close(ready)
 						<-signals
-						signaled <- struct{}{}
 						return nil
 					}), nil)
 				})
@@ -1550,13 +1595,6 @@ var _ = Describe("Container Store", func() {
 						}
 						return events
 					}).Should(ConsistOf("container_reserved", "container_complete"))
-				})
-
-				It("signals the cred manager to shut down", func() {
-					err := containerStore.Run(logger, containerGuid)
-					Expect(err).NotTo(HaveOccurred())
-
-					Eventually(cmSignaled).Should(Receive())
 				})
 			})
 
