@@ -371,6 +371,7 @@ func Initialize(logger lager.Logger, config ExecutorConfig, cellID string,
 		config.ProxyMemoryAllocationMB,
 		depotClient,
 		metronClient,
+		config.SetCPUWeight,
 	)
 
 	return depotClient, statsReporter,

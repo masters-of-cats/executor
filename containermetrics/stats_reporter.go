@@ -3,6 +3,7 @@ package containermetrics
 import (
 	"os"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"code.cloudfoundry.org/clock"
@@ -25,6 +26,7 @@ type StatsReporter struct {
 	metronClient          loggingclient.IngressClient
 	enableContainerProxy  bool
 	proxyMemoryAllocation float64
+	setCpuWeight          bool
 }
 
 type cpuInfo struct {
@@ -39,6 +41,7 @@ func NewStatsReporter(logger lager.Logger,
 	additionalMemoryMB int,
 	executorClient executor.Client,
 	metronClient loggingclient.IngressClient,
+	setCpuWeight bool,
 ) *StatsReporter {
 	return &StatsReporter{
 		logger: logger,
@@ -49,6 +52,7 @@ func NewStatsReporter(logger lager.Logger,
 		metronClient:          metronClient,
 		enableContainerProxy:  enableContainerProxy,
 		proxyMemoryAllocation: float64(additionalMemoryMB * megabytesToBytes),
+		setCpuWeight:          setCpuWeight,
 	}
 }
 
@@ -123,7 +127,7 @@ func (reporter *StatsReporter) emitContainerMetrics(logger lager.Logger, previou
 			metric.MemoryLimitInBytes = uint64(float64(metric.MemoryLimitInBytes) - reporter.proxyMemoryAllocation)
 		}
 
-		repMetrics, cpu := reporter.calculateAndSendMetrics(logger, metric.MetricsConfig, metric.ContainerMetrics, previousCPUInfo, now)
+		repMetrics, cpu := reporter.calculateAndSendMetrics(logger, metric.MetricsConfig, metric.ContainerMetrics, previousCPUInfo, now, container.Resource.MemoryMB)
 		if cpu != nil {
 			newCPUInfos[guid] = cpu
 		}
@@ -137,25 +141,45 @@ func (reporter *StatsReporter) emitContainerMetrics(logger lager.Logger, previou
 	return newCPUInfos
 }
 
+func (reporter *StatsReporter) calculateCPUPercentWeighted(cpuPercent float64, containerMemoryMB int) (float64, error) {
+	if !reporter.setCpuWeight {
+		return cpuPercent, nil
+	}
+
+	cellMemoryB, err := sysTotalMemory()
+	if err != nil {
+		return 0, err
+	}
+	cellMemoryMB := cellMemoryB / 1024 / 1024
+	return cpuPercent * float64(cellMemoryMB) / float64(containerMemoryMB), nil
+}
+
 func (reporter *StatsReporter) calculateAndSendMetrics(
 	logger lager.Logger,
 	metricsConfig executor.MetricsConfig,
 	containerMetrics executor.ContainerMetrics,
 	previousInfo *cpuInfo,
 	now time.Time,
+	containerMemoryMB int,
 ) (*CachedContainerMetrics, *cpuInfo) {
 	currentInfo, cpuPercent := calculateInfo(containerMetrics, previousInfo, now)
+
+	cpuPercentWeighted, err := reporter.calculateCPUPercentWeighted(cpuPercent, containerMemoryMB)
+	if err != nil {
+		logger.Error("get-cell-memory", err)
+	}
 
 	if metricsConfig.Guid != "" {
 		instanceIndex := int32(metricsConfig.Index)
 		err := reporter.metronClient.SendAppMetrics(&events.ContainerMetric{
-			ApplicationId:    &metricsConfig.Guid,
-			InstanceIndex:    &instanceIndex,
-			CpuPercentage:    &cpuPercent,
-			MemoryBytes:      &containerMetrics.MemoryUsageInBytes,
-			DiskBytes:        &containerMetrics.DiskUsageInBytes,
-			MemoryBytesQuota: &containerMetrics.MemoryLimitInBytes,
-			DiskBytesQuota:   &containerMetrics.DiskLimitInBytes,
+			ApplicationId:         &metricsConfig.Guid,
+			InstanceIndex:         &instanceIndex,
+			CpuPercentage:         &cpuPercent,
+			CpuPercentageWeighted: &cpuPercentWeighted,
+			MemoryBytes:           &containerMetrics.MemoryUsageInBytes,
+			DiskBytes:             &containerMetrics.DiskUsageInBytes,
+			MemoryBytesQuota:      &containerMetrics.MemoryLimitInBytes,
+			DiskBytesQuota:        &containerMetrics.DiskLimitInBytes,
 		})
 
 		if err != nil {
@@ -167,13 +191,35 @@ func (reporter *StatsReporter) calculateAndSendMetrics(
 	}
 
 	return &CachedContainerMetrics{
-		MetricGUID:       metricsConfig.Guid,
-		CPUUsageFraction: cpuPercent / 100,
-		DiskUsageBytes:   containerMetrics.DiskUsageInBytes,
-		DiskQuotaBytes:   containerMetrics.DiskLimitInBytes,
-		MemoryUsageBytes: containerMetrics.MemoryUsageInBytes,
-		MemoryQuotaBytes: containerMetrics.MemoryLimitInBytes,
+		MetricGUID:               metricsConfig.Guid,
+		CPUUsageFraction:         cpuPercent / 100,
+		CPUUsageFractionWeighted: cpuPercentWeighted / 100,
+		DiskUsageBytes:           containerMetrics.DiskUsageInBytes,
+		DiskQuotaBytes:           containerMetrics.DiskLimitInBytes,
+		MemoryUsageBytes:         containerMetrics.MemoryUsageInBytes,
+		MemoryQuotaBytes:         containerMetrics.MemoryLimitInBytes,
 	}, &currentInfo
+}
+
+func computeCPUWeightRatio() (float64, error) {
+	cellMemoryB, err := sysTotalMemory()
+	if err != nil {
+		return 0, err
+	}
+
+	return 1.0 / (float64(cellMemoryB) / float64(1024*1024)), nil
+}
+
+func sysTotalMemory() (uint64, error) {
+	in := &syscall.Sysinfo_t{}
+	err := syscall.Sysinfo(in)
+	if err != nil {
+		return 0, err
+	}
+	// If this is a 32-bit system, then these fields are
+	// uint32 instead of uint64.
+	// So we always convert to uint64 to match signature.
+	return uint64(in.Totalram) * uint64(in.Unit), nil
 }
 
 func calculateInfo(containerMetrics executor.ContainerMetrics, previousInfo *cpuInfo, now time.Time) (cpuInfo, float64) {
