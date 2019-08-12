@@ -30,6 +30,7 @@ type StatsReporter struct {
 type cpuInfo struct {
 	timeSpentInCPU time.Duration
 	timeOfSample   time.Time
+	isSpiking      bool
 }
 
 func NewStatsReporter(logger lager.Logger,
@@ -162,6 +163,15 @@ func (reporter *StatsReporter) calculateAndSendMetrics(
 		metricsConfig.Tags["instance_id"] = index
 	}
 
+	spikingState := loggingclient.CPUSpikeStateNoChange
+	previouslySpiking := previousInfo != nil && previousInfo.isSpiking
+	if currentInfo.isSpiking && !previouslySpiking {
+		spikingState = loggingclient.CPUSpikeStateStartSpiking
+	}
+	if !currentInfo.isSpiking && previouslySpiking {
+		spikingState = loggingclient.CPUSpikeStateEndSpiking
+	}
+
 	if applicationId != "" {
 		err := reporter.metronClient.SendAppMetrics(loggingclient.ContainerMetric{
 			CpuPercentage:          cpuPercent,
@@ -173,6 +183,7 @@ func (reporter *StatsReporter) calculateAndSendMetrics(
 			AbsoluteCPUEntitlement: containerMetrics.AbsoluteCPUEntitlementInNanoseconds,
 			ContainerAge:           containerMetrics.ContainerAgeInNanoseconds,
 			Tags:                   metricsConfig.Tags,
+			CPUSpikeState:          spikingState,
 		})
 
 		if err != nil {
@@ -198,6 +209,7 @@ func calculateInfo(containerMetrics executor.ContainerMetrics, previousInfo *cpu
 	currentInfo := cpuInfo{
 		timeSpentInCPU: containerMetrics.TimeSpentInCPU,
 		timeOfSample:   now,
+		isSpiking:      false,
 	}
 
 	var cpuPercent float64
@@ -210,7 +222,9 @@ func calculateInfo(containerMetrics executor.ContainerMetrics, previousInfo *cpu
 			previousInfo.timeOfSample,
 			currentInfo.timeOfSample,
 		)
+		currentInfo.isSpiking = uint64(containerMetrics.TimeSpentInCPU.Nanoseconds()) > containerMetrics.AbsoluteCPUEntitlementInNanoseconds
 	}
+
 	return currentInfo, cpuPercent
 }
 
